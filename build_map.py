@@ -51,9 +51,15 @@ for t in RAW:
 def resolve_ctx(c):
     """Context -> test number, or None.
 
-    Contexts look like "<nodeid>" (parent), "<spawning test>|<submitting test>" (pool workers:
-    coverage joins its static and dynamic contexts with "|"), or "<nodeid>|run" (pytest-cov).
-    The submitting test is the last part."""
+    "w:<spawner>|<test>" (cov_plugin): the part after the first "|" is the test; empty = idle.
+    A bare "w:<spawner>" is a worker's import/idle time and belongs to no test.
+    Older formats ("<nodeid>", "<a>|<b>", "<nodeid>|run") are still understood."""
+    if c.startswith("w:"):
+        if "|" not in c:
+            return None
+        c = c.split("|", 1)[1]
+        if not c:
+            return None
     if c in TESTS:
         return TESTS[c]
     i = c.rfind("|")
@@ -62,9 +68,7 @@ def resolve_ctx(c):
         if tail in TESTS:
             return TESTS[tail]
         i = c.rfind("|", 0, i)
-    # "<nodeid>|run|setup" style suffixes
-    head = c.split("|", 1)[0]
-    return TESTS.get(head)
+    return TESTS.get(c.split("|", 1)[0])
 
 
 def ctx_to_tests(ctxs, miss):
@@ -74,7 +78,8 @@ def ctx_to_tests(ctxs, miss):
             continue  # "" or a worker's idle/import time: no test is responsible
         n = resolve_ctx(c)
         if n is None:
-            miss.add(c)
+            if not c.startswith("w:"):  # "w:..." with no test = worker idle/import time, expected
+                miss.add(c)
         else:
             out.add(n)
     return out
@@ -190,7 +195,15 @@ def main():
             ts |= {TESTS[w]} if w in TESTS else BY_FILE.get(w, set())
         out["data"][path] = pool.add(ts)
 
-    names_index.add_names(out, SRC, pool)
+    users = {}
+    du = SRC / "dialect_use.json"
+    if du.exists():
+        for fam, nodeids in json.load(open(du)).items():
+            users[fam] = {TESTS[n] for n in nodeids if n in TESTS}
+        log(f"dialect_use.json: {len(users)} dialects, e.g. tsql -> {len(users.get('tsql', ()))} tests")
+    else:
+        log("WARNING: no dialect_use.json; dialect-constant edits will not be narrowed")
+    names_index.add_names(out, SRC, pool, users)
 
     out["sets"] = pool.encode()
     OUT.parent.mkdir(parents=True, exist_ok=True)

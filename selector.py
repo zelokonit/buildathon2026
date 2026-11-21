@@ -11,10 +11,12 @@ import ast
 import bisect
 import gzip
 import heapq
+import io
 import json
 import os
 import re
 import sys
+import tokenize
 from pathlib import Path
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
@@ -39,6 +41,7 @@ SCOPE_WIDEN = "scope"
 #   SEL_LEAKY = 1 re-enables the whole-file expansion for test_optimizer / test_executor
 NARROW = os.environ.get("SEL_NARROW", "stmt")
 SMALL_MODULE = int(os.environ.get("SEL_SMALL_MODULE", "60"))
+COMMENTS_HARMLESS = os.environ.get("SEL_COMMENTS", "1") == "1"  # comment/blank-only edits select nothing
 IMPORT_HEDGE = False  # also add the "importers of this module" set for module-level code edits
 LEAKY_FILES = {
     "tests/test_optimizer.py": ("sqlglot/optimizer/",),
@@ -71,6 +74,8 @@ class FileChange:
         self.removed: list[int] = []  # old-side line numbers that were removed/replaced
         self.inserted: list[tuple[int, int]] = []  # pure insertions: (old line before, old line after)
         self.hunks: list[list] = []  # [old_start, old_len, new_body_lines]
+        self.code_change = False  # some added/removed line is neither blank nor a '#' comment
+        self.added_new: list[int] = []  # new-side numbers of added lines
 
     @property
     def path(self) -> str:
@@ -84,7 +89,7 @@ GIT = re.compile(r"^diff --git a/(.*) b/(.*)$")
 def parse_patch(text: str) -> list[FileChange]:
     files: list[FileChange] = []
     cur: FileChange | None = None
-    old_n = old_left = new_left = 0
+    old_n = old_left = new_left = new_n = 0
     blk_removed: list[int] = []
     blk_added = 0
     blk_prev = 0
@@ -103,12 +108,18 @@ def parse_patch(text: str) -> list[FileChange]:
         if old_left > 0 or new_left > 0:
             c = line[:1]
             if c == "-":
+                if line[1:].strip() and not line[1:].lstrip().startswith("#"):
+                    cur.code_change = True
                 if not blk_removed and not blk_added:
                     blk_prev = old_n - 1
                 blk_removed.append(old_n)
                 old_n += 1
                 old_left -= 1
             elif c == "+":
+                if line[1:].strip() and not line[1:].lstrip().startswith("#"):
+                    cur.code_change = True
+                cur.added_new.append(new_n)
+                new_n += 1
                 if not blk_removed and not blk_added:
                     blk_prev = old_n - 1
                 blk_added += 1
@@ -119,6 +130,7 @@ def parse_patch(text: str) -> list[FileChange]:
             else:  # context (a blank context line may arrive as "")
                 flush()
                 old_n += 1
+                new_n += 1
                 old_left -= 1
                 new_left -= 1
                 body.append(line[1:])
@@ -152,6 +164,7 @@ def parse_patch(text: str) -> list[FileChange]:
                 o_len = int(m.group(2)) if m.group(2) is not None else 1
                 n_len = int(m.group(4)) if m.group(4) is not None else 1
                 old_n, old_left, new_left = o_start, o_len, n_len
+                new_n = int(m.group(3))
                 body = []
                 cur.hunks.append([o_start, o_len, body])
                 blk_removed, blk_added = [], 0
@@ -168,6 +181,38 @@ def apply_hunks(old_lines: list[str], hunks: list[list]) -> list[str]:
         pos = s + olen
     out.extend(old_lines[pos:])
     return out
+
+
+# --------------------------------------------------------------------------- comments
+
+
+def _string_spans(text: str) -> list[tuple[int, int]] | None:
+    """Row spans (first, last) of every multi-line string token."""
+    spans = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.start[0] != tok.end[0] and tok.type in (tokenize.STRING, getattr(tokenize, "FSTRING_MIDDLE", -1)):
+                spans.append((tok.start[0], tok.end[0]))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return None
+    return spans
+
+
+def comment_only(old_text: str, new_text: str, fc: "FileChange") -> bool:
+    """True if every changed line is a blank/'#' line that is not inside a string literal."""
+    if fc.code_change:
+        return False
+    new_spans = _string_spans(new_text)
+    old_spans = _string_spans(old_text)
+    if new_spans is None or old_spans is None:
+        return False
+    for n in fc.added_new:
+        if any(a <= n <= b for a, b in new_spans):
+            return False
+    for o in fc.removed:
+        if any(a <= o <= b for a, b in old_spans):
+            return False
+    return True
 
 
 # --------------------------------------------------------------------------- statements
@@ -318,9 +363,12 @@ class Selector:
         # 1. does the new file still parse? If not, every importer breaks.
         if fc.hunks and not fc.binary:
             try:
-                old_lines = (SRC / rel).read_text().split("\n")
+                old_text = (SRC / rel).read_text()
+                old_lines = old_text.split("\n")
                 new_text = "\n".join(apply_hunks(old_lines, fc.hunks))
                 ast.parse(new_text)
+                if COMMENTS_HARMLESS and comment_only(old_text, new_text, fc):
+                    return frozenset()  # same code, different comments/blank lines
             except SyntaxError:
                 out |= m.S(entry["imp"]) | m.scope_total(rel, 0)
                 return frozenset(out)
@@ -351,10 +399,11 @@ class Selector:
         # 2b. a changed constant/class attribute is read from other files: add its readers' tests.
         for r in fc.removed:
             for s_, e_, name in m.assign.get(rel, ()):
-                if s_ <= r <= e_ and name in m.names:
+                key = f"{rel}::{name}" if f"{rel}::{name}" in m.names else name
+                if s_ <= r <= e_ and key in m.names:
                     if EXPLAIN:
-                        log(f"    names[{name}] -> {len(m.S(m.names[name]))} tests")
-                    out |= m.S(m.names[name])
+                        log(f"    names[{key}] -> {len(m.S(m.names[key]))} tests")
+                    out |= m.S(m.names[key])
 
         # 3. pure insertions: the smallest scope containing both neighbours.
         for a, b in fc.inserted:

@@ -11,8 +11,11 @@ worker switches to the submitting test's context for the duration of that task
 
 run from the sqlglot checkout (serial; no xdist):
   COV_DATA=.coverage.ctx PYTHONPATH=<repo>/tools pytest -p cov_plugin -p no:xdist -p no:cacheprovider -q tests
-Output files: .coverage.ctx.<host>.<pid>.<rand> (parent and every child); build_map.py merges them all.
+Output files: .coverage.ctx.<host>.<pid>.<rand> (parent and every child) and dialect_use.json.
+Contexts: the parent writes "w:|<nodeid>", pool workers write "w:<spawning test>|<submitting test>";
+a context with nothing after the "|" is idle/import time and belongs to no test.
 """
+import json
 import os
 import sys
 
@@ -20,6 +23,7 @@ import coverage
 import pytest
 
 _cov = None
+_DIALECTS = {}  # dialect module stem -> {test nodeids that instantiated it}
 
 
 def pytest_configure(config):
@@ -34,7 +38,7 @@ def pytest_configure(config):
             f"data_file = {data}\n"
             "parallel = True\n"
             "concurrency = multiprocessing,thread\n"
-            "context = ${COV_CTX}\n"
+            "context = w:${COV_CTX}\n"
         )
     os.environ["COV_CTX"] = ""
     # spawned workers must be able to import cov_ctx_wrap
@@ -45,7 +49,26 @@ def pytest_configure(config):
     _cov = coverage.Coverage(config_file=rc)
     _cov.erase()
     _cov.start()
+    _patch_dialects()  # after start(): imports done here run in the "" context and are ignored
     sys.__stderr__.write(f"[cov_plugin] rcfile={rc} data={data}\n")
+
+
+def _patch_dialects():
+    """Record which dialects each test instantiates (used to narrow dialect-constant edits)."""
+    try:
+        from sqlglot.dialects.dialect import Dialect
+
+        orig = Dialect.__init__
+
+        def init(self, *args, **kwargs):
+            ctx = os.environ.get("COV_CTX", "")
+            if ctx:
+                _DIALECTS.setdefault(type(self).__module__.rsplit(".", 1)[-1], set()).add(ctx)
+            return orig(self, *args, **kwargs)
+
+        Dialect.__init__ = init
+    except Exception as e:  # pragma: no cover
+        sys.__stderr__.write(f"[cov_plugin] dialect probe NOT installed: {e!r}\n")
 
 
 def _patch_pool():
@@ -74,4 +97,7 @@ def pytest_unconfigure(config):
     if _cov is not None:
         _cov.stop()
         _cov.save()
+        with open(os.path.join(os.getcwd(), "dialect_use.json"), "w") as fh:
+            json.dump({k: sorted(v) for k, v in _DIALECTS.items()}, fh)
+        sys.__stderr__.write(f"[cov_plugin] dialect_use.json: {len(_DIALECTS)} dialects\n")
         sys.__stderr__.write("[cov_plugin] saved (children save on their own exit)\n")

@@ -12,6 +12,9 @@ from collections import defaultdict
 from pathlib import Path
 
 
+FAMILY_DIRS = {"dialects", "parsers", "generators", "typing"}
+
+
 def _upper(n):
     return n.isupper() or (n.replace("_", "").isalnum() and n == n.upper() and any(c.isalpha() for c in n))
 
@@ -32,7 +35,7 @@ def _assigns(tree):
     return out
 
 
-def add_names(out, src, pool):
+def add_names(out, src, pool, users=None):
     src = Path(src)
     out["assign"], out["names"] = {}, {}
     trees, all_names = {}, set()
@@ -70,4 +73,15 @@ def add_names(out, src, pool):
             by_name[nm] |= set(pool.sets[hit])
     for nm, u in by_name.items():
         out["names"][nm] = pool.add(u)
+    # A constant defined in a per-dialect file (dialects/parsers/generators/typing/<name>.py) can only
+    # matter to tests that instantiated that dialect: readers of the name, restricted to those tests.
+    users = users or {}
+    for rel, entries in out["assign"].items():
+        parts = Path(rel).parts
+        if len(parts) >= 3 and parts[0] == "sqlglot" and parts[1] in FAMILY_DIRS:
+            fam = Path(rel).stem
+            if fam in users:
+                for _, _, nm in entries:
+                    if nm in by_name:
+                        out["names"][f"{rel}::{nm}"] = pool.add(by_name[nm] & users[fam])
     return
