@@ -55,6 +55,27 @@ for tf in (root / "tests").rglob("*.py"):
         for path, keys in fix.items():
             if hit(keys, l):
                 log[path].add(nid)
+# Leftovers (e.g. tpc-h/*.csv.gz built from a directory + table name): link by directory name,
+# matched against literals, identifiers and test names, normalized ("tpc-ds" -> "tpcds").
+def norm(x): return "".join(c for c in x.lower() if c.isalnum())
+def names(node):
+    out = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    return out | {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+left = [p for p in fix if p not in log]
+dirkeys = {p: norm(Path(p).parent.name) for p in left}
+for tf in (root / "tests").rglob("*.py"):
+    trel = str(tf.relative_to(root))
+    cls_of = {}
+    tree = ast.parse(tf.read_text())
+    for c in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+        for f in c.body:
+            if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)): cls_of[id(f)] = c.name
+    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        if not fn.name.startswith("test"): continue
+        blob = norm(fn.name) + " " + " ".join(norm(x) for x in lits(fn) | names(fn))
+        nid = f"{trel}::{cls_of[id(fn)]}::{fn.name}" if id(fn) in cls_of else f"{trel}::{fn.name}"
+        for p, k in dirkeys.items():
+            if k and k in blob: log[p].add(nid)
 json.dump({k: sorted(v) for k, v in log.items()}, sys.stdout, indent=0)
 print(f"{len(log)} of {len(fix)} fixtures linked", file=sys.stderr)
 for path in sorted(set(fix) - set(log)):

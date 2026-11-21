@@ -26,14 +26,25 @@ MAX_WORKERS = 8
 WORKER_COST = 2.0
 
 # Knobs to tune against `make sample` (never against stored sample labels).
-NARROW_LINES = False  # True: a changed line uses only its own per-line set (missed 3 of 4 in practice)
+# Probe switch: "scope" = changed code uses its enclosing function/class set (default);
+# "module" = also add the whole file's union (wider, safer, slower).
+SCOPE_WIDEN = "scope"
+# How a changed (removed/replaced) line is looked up. Override with env vars while tuning:
+#   SEL_NARROW  = stmt (default) | line | scope
+#     line : tests that executed that exact line (narrowest, can miss changed conditions)
+#     stmt : tests that executed any line of the enclosing statement (a changed `if`/`and`/`or`
+#            can only affect tests that reached the statement)
+#     scope: the whole enclosing function/class/module (widest)
+#   SEL_SMALL_MODULE = a file whose whole-module test set is at most this big runs that whole set
+#   SEL_LEAKY = 1 re-enables the whole-file expansion for test_optimizer / test_executor
+NARROW = os.environ.get("SEL_NARROW", "stmt")
+SMALL_MODULE = int(os.environ.get("SEL_SMALL_MODULE", "60"))
 IMPORT_HEDGE = False  # also add the "importers of this module" set for module-level code edits
-# Coverage of fixture-driven suites is leaky (shared setUpClass work is credited to one test),
-# so when one of these files is touched, run the whole file. value = source prefixes that also trigger it.
 LEAKY_FILES = {
     "tests/test_optimizer.py": ("sqlglot/optimizer/",),
     "tests/test_executor.py": ("sqlglot/executor/",),
-}
+} if os.environ.get("SEL_LEAKY") == "1" else {}
+EXPLAIN = bool(os.environ.get("EXPLAIN"))  # log what each rule contributed
 UNKNOWN_FILE_RUNS_ALL = True  # unrecognized file type -> run everything
 
 # Files that cannot affect a test run.
@@ -159,6 +170,46 @@ def apply_hunks(old_lines: list[str], hunks: list[list]) -> list[str]:
     return out
 
 
+# --------------------------------------------------------------------------- statements
+
+
+_STMT_CACHE: dict[str, list[tuple[int, int]] | None] = {}
+
+
+def stmt_ranges(rel: str) -> list[tuple[int, int]] | None:
+    """Line ranges of simple statements and of compound-statement headers (old file)."""
+    if rel in _STMT_CACHE:
+        return _STMT_CACHE[rel]
+    out: list[tuple[int, int]] | None
+    try:
+        tree = ast.parse((SRC / rel).read_text())
+        out = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.stmt):
+                continue
+            body = getattr(node, "body", None)
+            if isinstance(body, list) and body:
+                start = node.lineno
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    start = min([d.lineno for d in node.decorator_list] + [node.lineno])
+                end = max(start, body[0].lineno - 1)
+            else:
+                start, end = node.lineno, node.end_lineno or node.lineno
+            out.append((start, end))
+    except (OSError, SyntaxError, ValueError):
+        out = None
+    _STMT_CACHE[rel] = out
+    return out
+
+
+def innermost_stmt(rel: str, line: int) -> tuple[int, int] | None:
+    best = None
+    for s, e in stmt_ranges(rel) or ():
+        if s <= line <= e and (best is None or e - s < best[1] - best[0]):
+            best = (s, e)
+    return best
+
+
 # --------------------------------------------------------------------------- map
 
 
@@ -194,6 +245,19 @@ class Map:
         if i >= 0 and lines[i][0] <= line <= lines[i][1]:
             return self.S(lines[i][2])
         return None
+
+    def range_set(self, rel: str, a: int, b: int) -> frozenset:
+        lines = self.src[rel]["lines"]
+        starts = self._starts.get(rel)
+        if starts is None:
+            starts = self._starts[rel] = [r[0] for r in lines]
+        i = max(bisect.bisect_right(starts, a) - 1, 0)
+        out: set[int] = set()
+        while i < len(lines) and lines[i][0] <= b:
+            if lines[i][1] >= a:
+                out |= self.S(lines[i][2])
+            i += 1
+        return frozenset(out)
 
     def scope_index(self, rel: str, a: int, b: int | None = None) -> int:
         best = 0
@@ -264,10 +328,19 @@ class Selector:
                 pass
 
         # 2. removed / replaced lines: narrow set if covered, else the enclosing scope.
-        # A changed condition (and->or, if x -> if not x) changes which later lines run,
-        # so per-line sets undercount. Default: the whole enclosing scope.
+        # Small module: just run everything that touches it (cheap, and immune to leaky coverage).
+        mod_total = m.scope_total(rel, 0)
+        if len(mod_total) <= SMALL_MODULE:
+            out |= mod_total
+
         for r in fc.removed:
-            ls = m.line_set(rel, r) if NARROW_LINES else None
+            ls = None
+            if NARROW == "line":
+                ls = m.line_set(rel, r)
+            elif NARROW == "stmt":
+                rng = innermost_stmt(rel, r)
+                if rng is not None:
+                    ls = m.range_set(rel, rng[0], rng[1]) or None  # empty -> scope fallback
             if ls is not None:
                 out |= ls
             else:
@@ -279,6 +352,8 @@ class Selector:
         for r in fc.removed:
             for s_, e_, name in m.assign.get(rel, ()):
                 if s_ <= r <= e_ and name in m.names:
+                    if EXPLAIN:
+                        log(f"    names[{name}] -> {len(m.S(m.names[name]))} tests")
                     out |= m.S(m.names[name])
 
         # 3. pure insertions: the smallest scope containing both neighbours.
@@ -323,7 +398,12 @@ class Selector:
                 out |= self.for_other(_as_deleted(fc))
             if len(out) == len(self.all):
                 break
-        if out and len(out) < len(self.all):
+        # leaky expansion only when sqlglot source changed; a fixture/test-file edit is already exact
+        src_changed = any(fc.path.startswith("sqlglot/") and fc.path.endswith(".py") for fc in files)
+        if EXPLAIN:
+            for fc in files:
+                log(f"  {fc.path}: {len(self.for_other(fc))} tests")
+        if src_changed and out and len(out) < len(self.all):
             changed = [fc.path for fc in files]
             for tf, prefixes in LEAKY_FILES.items():
                 own = self.paths.get(tf)
@@ -335,7 +415,8 @@ class Selector:
     def pack(self, sel) -> list[list[int]]:
         if not sel:
             return []
-        items = sorted(sel, key=lambda n: -self.secs[n])
+        secs = self.secs
+        items = sorted(sel, key=lambda n: -secs[n])
         best_cost, best = None, None
         for k in range(1, min(MAX_WORKERS, len(items)) + 1):
             heap = [(0.0, i) for i in range(k)]
@@ -343,11 +424,51 @@ class Selector:
             for n in items:
                 load, i = heapq.heappop(heap)
                 bins[i].append(n)
-                heapq.heappush(heap, (load + self.secs[n], i))
-            cost = max(h[0] for h in heap) + WORKER_COST * k
+                heapq.heappush(heap, (load + secs[n], i))
+            _improve(bins, secs)
+            cost = max(sum(secs[n] for n in b) for b in bins) + WORKER_COST * k
             if best_cost is None or cost < best_cost - 1e-9:
                 best_cost, best = cost, bins
         return best
+
+
+def _improve(bins, secs) -> None:
+    """Shrink the busiest bin by moving or swapping tests with the lightest bin."""
+    if len(bins) < 2:
+        return
+    loads = [sum(secs[n] for n in b) for b in bins]
+    for _ in range(300):
+        a = loads.index(max(loads))
+        b = loads.index(min(loads))
+        diff = loads[a] - loads[b]
+        if diff <= 1e-9:
+            return
+        half = diff / 2
+        best_gain, move = 0.0, None
+        for x in bins[a]:
+            w = secs[x]
+            if 0 < w < diff:  # move x from a to b
+                gain = min(w, diff - w)
+                if gain > best_gain + 1e-12:
+                    best_gain, move = gain, (x, None)
+            for y in bins[b]:  # swap x with y
+                d = w - secs[y]
+                if 0 < d < diff:
+                    gain = min(d, diff - d)
+                    if gain > best_gain + 1e-12:
+                        best_gain, move = gain, (x, y)
+        if move is None:
+            return
+        x, y = move
+        bins[a].remove(x)
+        bins[b].append(x)
+        loads[a] -= secs[x]
+        loads[b] += secs[x]
+        if y is not None:
+            bins[b].remove(y)
+            bins[a].append(y)
+            loads[a] += secs[y]
+            loads[b] -= secs[y]
 
 
 def _as_deleted(fc: FileChange) -> FileChange:

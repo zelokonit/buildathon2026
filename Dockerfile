@@ -14,7 +14,7 @@ RUN git clone https://github.com/tobymao/sqlglot /opt/sqlglot \
     && rm -rf .git
 
 # 3. Copy your own code and any committed maps
-COPY selector.py /app/selector.py
+COPY --chown=65534:65534 selector.py /app/selector.py
 COPY maps/ /app/maps/
 
 CMD ["python", "/app/selector.py"]

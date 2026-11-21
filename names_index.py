@@ -4,8 +4,7 @@ For every UPPER_CASE name assigned at module/class level, find every other place
 reads that name (ast.Name / ast.Attribute) and union the covering sets of the enclosing scopes.
 Adds out["assign"][rel] = [[start, end, name], ...] and out["names"][name] = setid.
 
-call from build_map.main() after the per-file loop, before out["sets"] = pool.encode():
-    import names_index; names_index.add_names(out, SRC, pool, ctx_sets)   # see below
+called from tools/build_map.py (already wired in).
 `pool` is the builder's Pool. Scope sets are already in out["src"][rel]["scopes"][i][4].
 """
 import ast
@@ -48,19 +47,27 @@ def add_names(out, src, pool):
             out["assign"][rel] = [[s, e, n] for s, e, n in a]
             all_names |= {n for _, _, n in a}
 
-    by_name = defaultdict(set)  # name -> {setid}
+    by_name = defaultdict(set)  # name -> set of test ids that executed a line reading it
     for rel, tree in trees.items():
-        scopes = out["src"][rel]["scopes"]
+        ent = out["src"][rel]
+        scopes, lines = ent["scopes"], ent["lines"]
         for node in ast.walk(tree):
             nm = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
-            if nm in all_names:
+            if nm not in all_names:
+                continue
+            ln = node.lineno
+            hit = None
+            for s0, e0, sid in lines:  # per-line coverage of the reading statement
+                if s0 <= ln <= e0:
+                    hit = sid
+                    break
+            if hit is None:  # uncovered or continuation line: the enclosing function/class
                 best = 0
                 for i, sc in enumerate(scopes):
-                    if sc[0] <= node.lineno <= sc[1]:
+                    if sc[0] <= ln <= sc[1]:
                         best = i
-                by_name[nm].add(scopes[best][4])
-    for nm, sids in by_name.items():
-        u = set()
-        for sid in sids:
-            u |= set(pool.sets[sid])
+                hit = scopes[best][4]
+            by_name[nm] |= set(pool.sets[hit])
+    for nm, u in by_name.items():
         out["names"][nm] = pool.add(u)
+    return
