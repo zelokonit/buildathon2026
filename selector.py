@@ -15,7 +15,12 @@ import io
 import json
 import os
 import re
+import shutil
+import signal
+import subprocess
 import sys
+import tempfile
+import time
 import tokenize
 from pathlib import Path
 
@@ -49,8 +54,55 @@ LEAKY_FILES = {
 } if os.environ.get("SEL_LEAKY") == "1" else {}
 # MEASUREMENT ONLY - never ship with these set. Drops tests from every selection so a board
 # submission shows (via misses and seconds) how many commits need them and what they cost.
+# Dialect-restricted names sets (a constant in dialects/<name>.py etc.) skip tests this slow: they are
+# "instantiate every dialect" loops (e.g. test_generator_memory) that never check one dialect's values.
+NAMES_FAMILY_DROP_SECONDS = float(os.environ.get("SEL_NAMES_DROP_SECONDS", "6"))
 DROP_TESTS = {int(x) for x in os.environ.get("SEL_DROP_TESTS", "").split(",") if x.strip()}
 DROP_SECONDS = float(os.environ.get("SEL_DROP_SECONDS") or 0)
+# --- Light-test gate (OFF unless SEL_GATE=1) ------------------------------------------------------
+# When the static selection contains a heavy test (>= SEL_GATE_HEAVY seconds), apply the patch to an
+# overlay in /tmp, run the *light* selected tests on it, and drop the heavy tests only if they all pass.
+# Anything unexpected (skips, errors, timeouts, the patched module never imported, budget exceeded)
+# keeps the heavy tests. Needs pytest and the test dependencies in the image (see requirements.lock).
+GATE = os.environ.get("SEL_GATE") == "1"
+GATE_HEAVY = float(os.environ.get("SEL_GATE_HEAVY", "6"))
+GATE_BUDGET = float(os.environ.get("SEL_GATE_BUDGET", "15"))  # recorded seconds of light tests we will run
+GATE_TIMEOUT = float(os.environ.get("SEL_GATE_TIMEOUT", "40"))  # wall seconds per commit
+GATE_TOTAL = float(os.environ.get("SEL_GATE_TOTAL", "90"))  # stop gating this many seconds after start
+_T0 = time.monotonic()
+
+# Installed as sitecustomize.py so EVERY interpreter started with this PYTHONPATH (pytest itself and the
+# spawned worker processes sqlglot's optimizer/executor tests use) imports the patched modules.
+GATE_SITE = """
+import importlib.abc, importlib.machinery, importlib.util, json, os, sys
+_T = json.loads(os.environ.get("GATE_OVERLAY", "{}"))
+class _F(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        t = _T.get(fullname)
+        if t is None:
+            return None
+        file, is_pkg, orig = t
+        loader = importlib.machinery.SourceFileLoader(fullname, file)
+        return importlib.util.spec_from_file_location(
+            fullname, file, loader=loader, submodule_search_locations=[orig] if is_pkg else None)
+if _T and not any(type(f).__name__ == "_F" for f in sys.meta_path):
+    sys.meta_path.insert(0, _F())
+"""
+
+GATE_PLUGIN = """
+import json, os, sys
+_T = json.loads(os.environ.get("GATE_OVERLAY", "{}"))
+def pytest_sessionfinish(session, exitstatus):
+    out = {}
+    for n in _T:
+        m = sys.modules.get(n)
+        out[n] = getattr(m, "__file__", None) if m else None
+    p = os.environ.get("GATE_CANARY")
+    if p:
+        with open(p, "w") as fh:
+            json.dump(out, fh)
+"""
+
 EXPLAIN = bool(os.environ.get("EXPLAIN"))  # log what each rule contributed
 UNKNOWN_FILE_RUNS_ALL = True  # unrecognized file type -> run everything
 
@@ -332,6 +384,8 @@ class Selector:
         self.m = m
         self.secs = {t["number"]: float(t["seconds"]) for t in tests}
         self.all = frozenset(self.secs)
+        self.ids = {t["number"]: t.get("id") for t in tests}
+        self._files: list = []
         self.paths: dict[str, set[int]] = {}
         for t in tests:
             p = self._path(t)
@@ -417,9 +471,12 @@ class Selector:
             for s_, e_, name in m.assign.get(rel, ()):
                 key = f"{rel}::{name}" if f"{rel}::{name}" in m.names else name
                 if s_ <= r <= e_ and key in m.names:
+                    add = m.S(m.names[key])
+                    if "::" in key and NAMES_FAMILY_DROP_SECONDS:
+                        add = frozenset(n for n in add if self.secs[n] < NAMES_FAMILY_DROP_SECONDS)
                     if EXPLAIN:
-                        log(f"    names[{key}] -> {len(m.S(m.names[key]))} tests")
-                    out |= m.S(m.names[key])
+                        log(f"    names[{key}] -> {len(add)} tests")
+                    out |= add
 
         # 2c. an added import can fail at load time for every importer of this module.
         if any(IMPORT_LINE.match(t) for t in fc.added_text):
@@ -460,6 +517,7 @@ class Selector:
 
     def select(self, patch_text: str) -> frozenset:
         files = parse_patch(patch_text)
+        self._files = files
         if not files:
             return self.all  # unparseable: be safe
         out: set[int] = set()
@@ -482,6 +540,86 @@ class Selector:
                 if own and (out & own or any(p.startswith(pre) for p in changed for pre in prefixes)):
                     out |= own
         return frozenset(out)
+
+    # -- light-test gate
+    def gate(self, chosen, cid):
+        heavy = frozenset(n for n in chosen if self.secs[n] >= GATE_HEAVY)
+        if not heavy:
+            return chosen
+        files = self._files
+        if not files or not all(fc.path.startswith("sqlglot/") and fc.path.endswith(".py")
+                                and fc.status in ("modified", "new") and fc.hunks for fc in files):
+            return chosen
+        light = chosen - heavy
+        ids = [self.ids.get(n) for n in sorted(light, key=lambda n: self.secs[n])]
+        if not light or any(i is None for i in ids):
+            return chosen
+        if sum(self.secs[n] for n in light) > GATE_BUDGET:
+            log(f"gate {cid}: light tests exceed budget, keeping heavy")
+            return chosen
+        if time.monotonic() - _T0 > GATE_TOTAL:
+            log(f"gate {cid}: total budget spent, keeping heavy")
+            return chosen
+        t0 = time.monotonic()
+        try:
+            verdict = self._gate_run(files, ids)
+        except Exception as e:  # never let the gate break the answer
+            log(f"gate {cid}: error {e!r}, keeping heavy")
+            return chosen
+        log(f"gate {cid}: {verdict} in {time.monotonic() - t0:.1f}s ({len(light)} light, {len(heavy)} heavy)")
+        return light if verdict == "pass" else chosen
+
+    def _gate_run(self, files, nodeids) -> str:
+        tmp = tempfile.mkdtemp(prefix="gate_")
+        try:
+            table = {}
+            for fc in files:
+                rel = fc.path
+                old = (SRC / rel).read_text().split("\n") if fc.status == "modified" else []
+                new_text = "\n".join(apply_hunks(old, fc.hunks))
+                ast.parse(new_text)
+                dest = Path(tmp) / "overlay" / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(new_text)
+                mod = rel[:-3].replace("/", ".")
+                is_pkg = mod.endswith(".__init__")
+                if is_pkg:
+                    mod = mod[: -len(".__init__")]
+                table[mod] = [str(dest), is_pkg, str((SRC / rel).parent)]
+            (Path(tmp) / "gate_overlay.py").write_text(GATE_PLUGIN)
+            (Path(tmp) / "sitecustomize.py").write_text(GATE_SITE)
+            canary = Path(tmp) / "canary.json"
+            extra = os.environ.get("SEL_GATE_EXTRA_PYTHONPATH")
+            env = dict(
+                os.environ,
+                PYTHONPATH=os.pathsep.join([p for p in (extra, tmp, str(SRC)) if p]),
+                PYTHONDONTWRITEBYTECODE="1",
+                SKIP_INTEGRATION="0",
+                GATE_OVERLAY=json.dumps(table),
+                GATE_CANARY=str(canary),
+            )
+            cmd = [sys.executable, "-m", "pytest", "-p", "gate_overlay", "-p", "no:cacheprovider", "-q",
+                   "--tb=no", "-x", "--no-header", "-W", "ignore", "-c", "/dev/null", "--rootdir", str(SRC),
+                   *nodeids]
+            proc = subprocess.Popen(cmd, cwd=str(SRC), env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            try:
+                out, _ = proc.communicate(timeout=GATE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate()
+                return "timeout"
+            if proc.returncode == 1 or re.search(r"\d+ failed|SUBFAIL|\d+ error", out):
+                return "fail"
+            loaded = False
+            if canary.exists():
+                loaded = any(v and v.startswith(tmp) for v in json.loads(canary.read_text()).values())
+            if (proc.returncode == 0 and re.search(r"\d+ passed", out)
+                    and not re.search(r"\d+ (skipped|deselected)", out) and loaded):
+                return "pass"
+            return "inconclusive"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     # -- worker packing
     def pack(self, sel) -> list[list[int]]:
@@ -566,10 +704,12 @@ def main() -> None:
         except Exception as e:
             log(patch.stem, "selection failed, running all:", repr(e))
             chosen = sel.all
-        if DROP_TESTS or DROP_SECONDS:
+        if GATE and chosen and len(chosen) < len(sel.all):
+            chosen = sel.gate(chosen, patch.stem)
+        if GATE or DROP_TESTS or DROP_SECONDS:
             chosen = frozenset(n for n in chosen if n not in DROP_TESTS
                                and not (DROP_SECONDS and sel.secs[n] >= DROP_SECONDS))
-            workers = sel.pack(chosen)
+            workers = all_workers if len(chosen) == len(sel.all) else sel.pack(chosen)
             n_none += not workers
         elif len(chosen) == len(sel.all):
             workers = all_workers
