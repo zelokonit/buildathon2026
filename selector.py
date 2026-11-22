@@ -32,19 +32,23 @@ SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))  # clone from the Dock
 MAX_WORKERS = 8
 WORKER_COST = 2.0
 
-# --- Evidence-width policy -----------------------------------------------------------------------
-# How specific is the map evidence behind a test? Every rule reports the size of the set that selected
-# the test: the number of tests that executed the changed statement, read the changed constant, import
-# the module, ... A cheap test is always kept. An expensive one is only worth its seconds when the
-# evidence is tight: a line that a wide end-to-end test (test_execute_tpcds is 21.4 s and executes most
-# of sqlglot) merely happens to pass through is weak proof, a line only 30 tests reach is strong proof.
-# Measured on the 30 sample commits plus 8 independent mutations of the pinned commit: dropping the
-# >= 6 s tests whose evidence set exceeds SEL_EVID_WIDTH takes 173.457 s -> 135.223 s with no misses.
-# Anything in 38..50 scores the same; the widest expensive test that *has* to survive (test_execute_tpcds
-# on the serde change) is reached by 37 tests, so 50 keeps the largest margin. 30 already misses 3utz;
-# 52+ stops dropping it on 66ks. 0 disables the policy.
+# --- Evidence budget -----------------------------------------------------------------------------
+# Every rule reports the size of the set that selected a test: how many tests executed the changed
+# statement, read the changed constant, import the module, read that fixture, ... A test is worth
+# reporting only up to a budget of  seconds x audience : a 0.05 s test that a whole-module rule hands us
+# along with 300 others is nearly free (0.05 x 300 = 15), while test_execute_tpcds (21.4 s, executes
+# most of sqlglot) costs 21.4 x 87 = 1862 on a change it merely passes through and 21.4 x 37 = 794 on
+# the serde change where it really fails. SEL_EVID_BUDGET is that cut-off; 0 disables the policy.
+# Measured on the 30 sample commits and 8 independent mutations of the pinned commit (see the
+# SEL_EVID_WIDTH note below for the older two-threshold form of the same policy).
+# Expensive tests (>= SEL_EVID_CHEAP seconds) are kept only when their evidence set is at most
+# SEL_EVID_WIDTH tests wide; this is the rule that drops test_execute_tpcds on the two sample commits
+# where it passes and keeps it on the two where it fails (37 and 29 tests reach those statements).
 EVID_WIDTH = int(os.environ.get("SEL_EVID_WIDTH", "50"))
 EVID_CHEAP_SECS = float(os.environ.get("SEL_EVID_CHEAP", "6.0"))
+# Cheap tests are kept unless seconds x evidence-width exceeds this budget, which is what trims the
+# reader sets that a dialect constant or a hot module hands us. 0 keeps every cheap test.
+EVID_BUDGET = float(os.environ.get("SEL_EVID_BUDGET", "200"))
 
 # Knobs to tune against `make sample` (never against stored sample labels).
 # Probe switch: "scope" = changed code uses its enclosing function/class set (default);
@@ -124,8 +128,21 @@ UNKNOWN_FILE_RUNS_ALL = True  # unrecognized file type -> run everything
 
 # Files that cannot affect a test run.
 HARMLESS = re.compile(
-    r"(^docs/|^posts/|^\.github/|^\.git|\.(md|rst|png|jpg|svg|gif)$|^LICENSE|^CHANGELOG|^README|^CONTRIBUTING)"
+    r"(^docs/|^posts/|^benchmarks/|^pdoc/|^\.github/|^\.git|\.(md|rst|png|jpg|svg|gif)$|"
+    r"^LICENSE|^CHANGELOG|^README|^CONTRIBUTING|^AGENTS\.md$|^CLAUDE\.md$|^Makefile$|^\.dockerignore$)"
 )
+# Project-level paths the suite reaches through exactly one test file (verified against the pinned
+# commit: sqlglotc is only imported by tests/test_sqlglotc.py, which builds it from pyproject/setup,
+# and sqlglot-integration-tests only by tests/test_integration_loader.py). Running all 1620 tests for
+# such a change costs the whole suite for nothing.
+EXTRA_LINKS = {
+    "sqlglotc/": "tests/test_sqlglotc.py",
+    "pyproject.toml": "tests/test_sqlglotc.py",
+    "setup.py": "tests/test_sqlglotc.py",
+    "setup.cfg": "tests/test_sqlglotc.py",
+    "MANIFEST.in": "tests/test_sqlglotc.py",
+    "sqlglot-integration-tests/": "tests/test_integration_loader.py",
+}
 # Files under tests/ that are shared infrastructure.
 TEST_FILE = re.compile(r"(^|/)test_[^/]*\.py$")
 
@@ -543,6 +560,12 @@ class Selector:
                     return own
                 return frozenset() if fc.status == "new" else self.all
             return self.all  # conftest, helpers, __init__
+        for prefix, test_file in EXTRA_LINKS.items():
+            if path == prefix or path.startswith(prefix):
+                own = self.tests_in_file(test_file)
+                if own is not None:
+                    self._add(set(), own, 0)
+                    return own
         if HARMLESS.search(path):
             return frozenset()
         return self.all if UNKNOWN_FILE_RUNS_ALL else frozenset()
@@ -574,11 +597,16 @@ class Selector:
                     out = frozenset(out | own)
                     for n in own:
                         self._width.setdefault(n, len(self.all))
-        if EVID_WIDTH:
-            return frozenset(n for n in out
-                             if self.secs[n] < EVID_CHEAP_SECS
-                             or self._width.get(n, len(self.all)) <= EVID_WIDTH)
+        if EVID_WIDTH or EVID_BUDGET:
+            return frozenset(n for n in out if self._worth_running(n))
         return frozenset(out)
+
+    def _worth_running(self, n: int) -> bool:
+        secs = self.secs[n]
+        width = max(self._width.get(n, len(self.all)), 1)
+        if secs >= EVID_CHEAP_SECS:
+            return not EVID_WIDTH or width <= EVID_WIDTH
+        return not EVID_BUDGET or secs * width <= EVID_BUDGET
 
     # -- light-test gate
     def gate(self, chosen, cid):
@@ -739,6 +767,9 @@ def main() -> None:
     sel = Selector(tests, m)
     all_workers = sel.pack(sel.all)
     n_all = n_none = 0
+    total_ms = heavy_ms = 0
+    n_heavy = n_commits = 0
+    costs: list[tuple[str, int]] = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
             chosen = sel.select(patch.read_text(errors="replace"))
@@ -758,9 +789,22 @@ def main() -> None:
         else:
             workers = sel.pack(chosen)
             n_none += not workers
-        log(f"{patch.stem}: {len(chosen)} tests, {len(workers)} workers")
+        occ = [w for w in workers if w]
+        loads = [sum(int(sel.secs[n] * 1000 + 0.5) for n in w) for w in occ]
+        cost = (max(loads) + 2000 * len(occ)) if occ else 0
+        total_ms += cost
+        n_commits += 1
+        costs.append((patch.stem, cost))
+        if cost >= 6000:
+            heavy_ms += cost
+            n_heavy += 1
+        log(f"{patch.stem}: {len(chosen)} tests, {len(workers)} workers, "
+            f"cost {cost / 1000:.3f}s (max {max(loads) / 1000 if loads else 0:.3f}s)")
         print(json.dumps({"commit": patch.stem, "workers": workers}))
     log(f"all-tests commits: {n_all}, empty commits: {n_none}")
+    log(f"simulated {total_ms / 1000:.3f}s over {n_commits} commits; "
+        f"{n_heavy} commits cost >=6s and account for {heavy_ms / 1000:.3f}s")
+    log("biggest: " + ", ".join(f"{c / 1000:.2f}s {cid}" for cid, c in sorted(costs, key=lambda kv: -kv[1])[:8]))
 
 
 if __name__ == "__main__":
