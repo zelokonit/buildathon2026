@@ -17,6 +17,6 @@ RUN git clone https://github.com/tobymao/sqlglot /opt/sqlglot \
 COPY --chown=65534:65534 selector.py /app/selector.py
 COPY maps/ /app/maps/
 
-ENV SEL_DROP_TESTS=1490
+ENV SEL_DROP_TESTS=1106
 
 CMD ["python", "/app/selector.py"]
