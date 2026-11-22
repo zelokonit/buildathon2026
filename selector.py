@@ -47,6 +47,10 @@ LEAKY_FILES = {
     "tests/test_optimizer.py": ("sqlglot/optimizer/",),
     "tests/test_executor.py": ("sqlglot/executor/",),
 } if os.environ.get("SEL_LEAKY") == "1" else {}
+# MEASUREMENT ONLY - never ship with these set. Drops tests from every selection so a board
+# submission shows (via misses and seconds) how many commits need them and what they cost.
+DROP_TESTS = {int(x) for x in os.environ.get("SEL_DROP_TESTS", "").split(",") if x.strip()}
+DROP_SECONDS = float(os.environ.get("SEL_DROP_SECONDS") or 0)
 EXPLAIN = bool(os.environ.get("EXPLAIN"))  # log what each rule contributed
 UNKNOWN_FILE_RUNS_ALL = True  # unrecognized file type -> run everything
 
@@ -76,6 +80,7 @@ class FileChange:
         self.hunks: list[list] = []  # [old_start, old_len, new_body_lines]
         self.code_change = False  # some added/removed line is neither blank nor a '#' comment
         self.added_new: list[int] = []  # new-side numbers of added lines
+        self.added_text: list[str] = []
 
     @property
     def path(self) -> str:
@@ -119,6 +124,7 @@ def parse_patch(text: str) -> list[FileChange]:
                 if line[1:].strip() and not line[1:].lstrip().startswith("#"):
                     cur.code_change = True
                 cur.added_new.append(new_n)
+                cur.added_text.append(line[1:])
                 new_n += 1
                 if not blk_removed and not blk_added:
                     blk_prev = old_n - 1
@@ -218,14 +224,14 @@ def comment_only(old_text: str, new_text: str, fc: "FileChange") -> bool:
 # --------------------------------------------------------------------------- statements
 
 
-_STMT_CACHE: dict[str, list[tuple[int, int]] | None] = {}
+_STMT_CACHE: dict[str, list[tuple[int, int, str]] | None] = {}
 
 
-def stmt_ranges(rel: str) -> list[tuple[int, int]] | None:
+def stmt_ranges(rel: str) -> list[tuple[int, int, str]] | None:
     """Line ranges of simple statements and of compound-statement headers (old file)."""
     if rel in _STMT_CACHE:
         return _STMT_CACHE[rel]
-    out: list[tuple[int, int]] | None
+    out: list[tuple[int, int, str]] | None
     try:
         tree = ast.parse((SRC / rel).read_text())
         out = []
@@ -240,19 +246,22 @@ def stmt_ranges(rel: str) -> list[tuple[int, int]] | None:
                 end = max(start, body[0].lineno - 1)
             else:
                 start, end = node.lineno, node.end_lineno or node.lineno
-            out.append((start, end))
+            out.append((start, end, type(node).__name__))
     except (OSError, SyntaxError, ValueError):
         out = None
     _STMT_CACHE[rel] = out
     return out
 
 
-def innermost_stmt(rel: str, line: int) -> tuple[int, int] | None:
+def innermost_stmt(rel: str, line: int) -> tuple[int, int, str] | None:
     best = None
-    for s, e in stmt_ranges(rel) or ():
+    for s, e, kind in stmt_ranges(rel) or ():
         if s <= line <= e and (best is None or e - s < best[1] - best[0]):
-            best = (s, e)
+            best = (s, e, kind)
     return best
+
+
+IMPORT_LINE = re.compile(r"^\s*(import|from)\s")
 
 
 # --------------------------------------------------------------------------- map
@@ -380,6 +389,8 @@ class Selector:
         mod_total = m.scope_total(rel, 0)
         if len(mod_total) <= SMALL_MODULE:
             out |= mod_total
+        if EXPLAIN:
+            log(f"    module union {len(mod_total)} tests" + (" (small-module rule: used)" if len(mod_total) <= SMALL_MODULE else ""))
 
         for r in fc.removed:
             ls = None
@@ -389,6 +400,11 @@ class Selector:
                 rng = innermost_stmt(rel, r)
                 if rng is not None:
                     ls = m.range_set(rel, rng[0], rng[1]) or None  # empty -> scope fallback
+                    if rng[2] in ("Import", "ImportFrom"):  # runs once at load time: every importer
+                        out |= m.S(entry["imp"])
+            if EXPLAIN:
+                log(f"    removed line {r}: " + (f"narrow set {len(ls)} tests" if ls is not None
+                    else f"scope fallback {len(m.scope_total(rel, m.scope_index(rel, r)))} tests"))
             if ls is not None:
                 out |= ls
             else:
@@ -405,9 +421,15 @@ class Selector:
                         log(f"    names[{key}] -> {len(m.S(m.names[key]))} tests")
                     out |= m.S(m.names[key])
 
+        # 2c. an added import can fail at load time for every importer of this module.
+        if any(IMPORT_LINE.match(t) for t in fc.added_text):
+            out |= m.S(entry["imp"])
+
         # 3. pure insertions: the smallest scope containing both neighbours.
         for a, b in fc.inserted:
             i = m.scope_index(rel, max(a, 1), b)
+            if EXPLAIN:
+                log(f"    insertion after line {a}: scope union {len(m.scope_total(rel, i))} tests")
             out |= m.scope_total(rel, i)
             if IMPORT_HEDGE and m.src[rel]["scopes"][i][3] != "func":
                 out |= m.S(entry["imp"])
@@ -442,16 +464,17 @@ class Selector:
             return self.all  # unparseable: be safe
         out: set[int] = set()
         for fc in files:
-            out |= self.for_other(fc)
+            r = self.for_other(fc)
             if fc.status == "renamed" and fc.old:
-                out |= self.for_other(_as_deleted(fc))
+                r = r | self.for_other(_as_deleted(fc))
+            if EXPLAIN:
+                log(f"  {fc.path}: {len(r)} tests")
+            out |= r
             if len(out) == len(self.all):
                 break
+        out = frozenset(out)
         # leaky expansion only when sqlglot source changed; a fixture/test-file edit is already exact
         src_changed = any(fc.path.startswith("sqlglot/") and fc.path.endswith(".py") for fc in files)
-        if EXPLAIN:
-            for fc in files:
-                log(f"  {fc.path}: {len(self.for_other(fc))} tests")
         if src_changed and out and len(out) < len(self.all):
             changed = [fc.path for fc in files]
             for tf, prefixes in LEAKY_FILES.items():
@@ -543,7 +566,12 @@ def main() -> None:
         except Exception as e:
             log(patch.stem, "selection failed, running all:", repr(e))
             chosen = sel.all
-        if len(chosen) == len(sel.all):
+        if DROP_TESTS or DROP_SECONDS:
+            chosen = frozenset(n for n in chosen if n not in DROP_TESTS
+                               and not (DROP_SECONDS and sel.secs[n] >= DROP_SECONDS))
+            workers = sel.pack(chosen)
+            n_none += not workers
+        elif len(chosen) == len(sel.all):
             workers = all_workers
             n_all += 1
         else:
