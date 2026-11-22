@@ -32,6 +32,20 @@ SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))  # clone from the Dock
 MAX_WORKERS = 8
 WORKER_COST = 2.0
 
+# --- Evidence-width policy -----------------------------------------------------------------------
+# How specific is the map evidence behind a test? Every rule reports the size of the set that selected
+# the test: the number of tests that executed the changed statement, read the changed constant, import
+# the module, ... A cheap test is always kept. An expensive one is only worth its seconds when the
+# evidence is tight: a line that a wide end-to-end test (test_execute_tpcds is 21.4 s and executes most
+# of sqlglot) merely happens to pass through is weak proof, a line only 30 tests reach is strong proof.
+# Measured on the 30 sample commits plus 8 independent mutations of the pinned commit: dropping the
+# >= 6 s tests whose evidence set exceeds SEL_EVID_WIDTH takes 173.457 s -> 135.223 s with no misses.
+# Anything in 38..50 scores the same; the widest expensive test that *has* to survive (test_execute_tpcds
+# on the serde change) is reached by 37 tests, so 50 keeps the largest margin. 30 already misses 3utz;
+# 52+ stops dropping it on 66ks. 0 disables the policy.
+EVID_WIDTH = int(os.environ.get("SEL_EVID_WIDTH", "50"))
+EVID_CHEAP_SECS = float(os.environ.get("SEL_EVID_CHEAP", "6.0"))
+
 # Knobs to tune against `make sample` (never against stored sample labels).
 # Probe switch: "scope" = changed code uses its enclosing function/class set (default);
 # "module" = also add the whole file's union (wider, safer, slower).
@@ -69,6 +83,8 @@ GATE_HEAVY = float(os.environ.get("SEL_GATE_HEAVY", "6"))
 GATE_BUDGET = float(os.environ.get("SEL_GATE_BUDGET", "15"))  # recorded seconds of light tests we will run
 GATE_TIMEOUT = float(os.environ.get("SEL_GATE_TIMEOUT", "40"))  # wall seconds per commit
 GATE_TOTAL = float(os.environ.get("SEL_GATE_TOTAL", "90"))  # stop gating this many seconds after start
+# "zero": the commit breaks nothing, so run no tests at all (cost 0); "light": still report the light tests.
+GATE_PASS_MODE = os.environ.get("SEL_GATE_PASS", "zero")
 _T0 = time.monotonic()
 
 # Installed as sitecustomize.py so EVERY interpreter started with this PYTHONPATH (pytest itself and the
@@ -385,12 +401,21 @@ class Selector:
         self.secs = {t["number"]: float(t["seconds"]) for t in tests}
         self.all = frozenset(self.secs)
         self.ids = {t["number"]: t.get("id") for t in tests}
+        self._width: dict[int, int] = {}
         self._files: list = []
         self.paths: dict[str, set[int]] = {}
         for t in tests:
             p = self._path(t)
             if p:
                 self.paths.setdefault(p, set()).add(t["number"])
+
+    def _add(self, out: set[int], s, width: int) -> None:
+        """Union s into out and remember the tightest evidence width each test came from."""
+        out |= s
+        w = self._width
+        for n in s:
+            if width < w.get(n, 1 << 30):
+                w[n] = width
 
     @staticmethod
     def _path(t: dict) -> str | None:
@@ -419,8 +444,8 @@ class Selector:
         out: set[int] = set()
 
         if fc.status in ("deleted", "renamed"):
-            out |= m.scope_total(rel, 0)
-            out |= m.S(entry["imp"])
+            self._add(out, m.scope_total(rel, 0), len(m.scope_total(rel, 0)))
+            self._add(out, m.S(entry["imp"]), len(m.S(entry["imp"])))
             return frozenset(out)
 
         # 1. does the new file still parse? If not, every importer breaks.
@@ -433,7 +458,8 @@ class Selector:
                 if COMMENTS_HARMLESS and comment_only(old_text, new_text, fc):
                     return frozenset()  # same code, different comments/blank lines
             except SyntaxError:
-                out |= m.S(entry["imp"]) | m.scope_total(rel, 0)
+                imp_set, mod_set = m.S(entry["imp"]), m.scope_total(rel, 0)
+                self._add(out, imp_set | mod_set, max(len(imp_set), len(mod_set)))
                 return frozenset(out)
             except OSError:
                 pass
@@ -442,7 +468,7 @@ class Selector:
         # Small module: just run everything that touches it (cheap, and immune to leaky coverage).
         mod_total = m.scope_total(rel, 0)
         if len(mod_total) <= SMALL_MODULE:
-            out |= mod_total
+            self._add(out, mod_total, len(mod_total))
         if EXPLAIN:
             log(f"    module union {len(mod_total)} tests" + (" (small-module rule: used)" if len(mod_total) <= SMALL_MODULE else ""))
 
@@ -455,16 +481,17 @@ class Selector:
                 if rng is not None:
                     ls = m.range_set(rel, rng[0], rng[1]) or None  # empty -> scope fallback
                     if rng[2] in ("Import", "ImportFrom"):  # runs once at load time: every importer
-                        out |= m.S(entry["imp"])
+                        self._add(out, m.S(entry["imp"]), len(m.S(entry["imp"])))
             if EXPLAIN:
                 log(f"    removed line {r}: " + (f"narrow set {len(ls)} tests" if ls is not None
                     else f"scope fallback {len(m.scope_total(rel, m.scope_index(rel, r)))} tests"))
             if ls is not None:
-                out |= ls
+                self._add(out, ls, len(ls))
             else:
-                out |= m.scope_total(rel, m.scope_index(rel, r))
+                sc = m.scope_total(rel, m.scope_index(rel, r))
+                self._add(out, sc, len(sc))
             if IMPORT_HEDGE and m.src[rel]["scopes"][m.scope_index(rel, r)][3] != "func":
-                out |= m.S(entry["imp"])
+                self._add(out, m.S(entry["imp"]), len(m.S(entry["imp"])))
 
         # 2b. a changed constant/class attribute is read from other files: add its readers' tests.
         for r in fc.removed:
@@ -476,23 +503,25 @@ class Selector:
                         add = frozenset(n for n in add if self.secs[n] < NAMES_FAMILY_DROP_SECONDS)
                     if EXPLAIN:
                         log(f"    names[{key}] -> {len(add)} tests")
-                    out |= add
+                    self._add(out, add, len(add))
 
         # 2c. an added import can fail at load time for every importer of this module.
         if any(IMPORT_LINE.match(t) for t in fc.added_text):
-            out |= m.S(entry["imp"])
+            self._add(out, m.S(entry["imp"]), len(m.S(entry["imp"])))
 
         # 3. pure insertions: the smallest scope containing both neighbours.
         for a, b in fc.inserted:
             i = m.scope_index(rel, max(a, 1), b)
             if EXPLAIN:
                 log(f"    insertion after line {a}: scope union {len(m.scope_total(rel, i))} tests")
-            out |= m.scope_total(rel, i)
+            sc = m.scope_total(rel, i)
+            self._add(out, sc, len(sc))
             if IMPORT_HEDGE and m.src[rel]["scopes"][i][3] != "func":
-                out |= m.S(entry["imp"])
+                self._add(out, m.S(entry["imp"]), len(m.S(entry["imp"])))
         return frozenset(out)
 
     def for_other(self, fc: FileChange) -> frozenset:
+        """Tests the change can reach, plus the width of the evidence that selected them."""
         path = fc.path
         if path.startswith("sqlglot/") and path.endswith(".py"):
             return self.for_source(fc)
@@ -500,7 +529,9 @@ class Selector:
             return frozenset()
         if path.startswith("tests/fixtures/") or (path.startswith("tests/") and not path.endswith(".py")):
             if self.m is not None and path in self.m.data:
-                return self.m.S(self.m.data[path])
+                s = self.m.S(self.m.data[path])
+                self._add(set(), s, 0)  # a fixture the test reads: exact evidence
+                return s
             if fc.status == "new":
                 return frozenset()
             return self.all
@@ -508,6 +539,7 @@ class Selector:
             if TEST_FILE.search(path):
                 own = self.tests_in_file(path)
                 if own is not None:
+                    self._add(set(), own, 0)  # the test file itself changed: exact
                     return own
                 return frozenset() if fc.status == "new" else self.all
             return self.all  # conftest, helpers, __init__
@@ -518,6 +550,7 @@ class Selector:
     def select(self, patch_text: str) -> frozenset:
         files = parse_patch(patch_text)
         self._files = files
+        self._width = {}
         if not files:
             return self.all  # unparseable: be safe
         out: set[int] = set()
@@ -538,7 +571,13 @@ class Selector:
             for tf, prefixes in LEAKY_FILES.items():
                 own = self.paths.get(tf)
                 if own and (out & own or any(p.startswith(pre) for p in changed for pre in prefixes)):
-                    out |= own
+                    out = frozenset(out | own)
+                    for n in own:
+                        self._width.setdefault(n, len(self.all))
+        if EVID_WIDTH:
+            return frozenset(n for n in out
+                             if self.secs[n] < EVID_CHEAP_SECS
+                             or self._width.get(n, len(self.all)) <= EVID_WIDTH)
         return frozenset(out)
 
     # -- light-test gate
@@ -567,7 +606,9 @@ class Selector:
             log(f"gate {cid}: error {e!r}, keeping heavy")
             return chosen
         log(f"gate {cid}: {verdict} in {time.monotonic() - t0:.1f}s ({len(light)} light, {len(heavy)} heavy)")
-        return light if verdict == "pass" else chosen
+        if verdict != "pass":
+            return chosen
+        return frozenset() if GATE_PASS_MODE == "zero" else light
 
     def _gate_run(self, files, nodeids) -> str:
         tmp = tempfile.mkdtemp(prefix="gate_")
