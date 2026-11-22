@@ -45,10 +45,14 @@ WORKER_COST = 2.0
 # SEL_EVID_WIDTH tests wide; this is the rule that drops test_execute_tpcds on the two sample commits
 # where it passes and keeps it on the two where it fails (37 and 29 tests reach those statements).
 EVID_WIDTH = int(os.environ.get("SEL_EVID_WIDTH", "50"))
-EVID_CHEAP_SECS = float(os.environ.get("SEL_EVID_CHEAP", "6.0"))
+EVID_CHEAP_SECS = float(os.environ.get("SEL_EVID_CHEAP", "0.3"))
 # Cheap tests are kept unless seconds x evidence-width exceeds this budget, which is what trims the
 # reader sets that a dialect constant or a hot module hands us. 0 keeps every cheap test.
 EVID_BUDGET = float(os.environ.get("SEL_EVID_BUDGET", "200"))
+# Hard ceiling on single-test cost: a test this slow is reported only when its evidence is very
+# specific (at most SEL_TIGHT_WIDTH tests reached the statement). 0 disables the ceiling.
+MAX_TEST_SECS = float(os.environ.get("SEL_MAX_TEST_SECS", "0"))
+TIGHT_WIDTH = int(os.environ.get("SEL_TIGHT_WIDTH", "10"))
 
 # Knobs to tune against `make sample` (never against stored sample labels).
 # Probe switch: "scope" = changed code uses its enclosing function/class set (default);
@@ -604,6 +608,8 @@ class Selector:
     def _worth_running(self, n: int) -> bool:
         secs = self.secs[n]
         width = max(self._width.get(n, len(self.all)), 1)
+        if MAX_TEST_SECS and secs >= MAX_TEST_SECS:
+            return width <= TIGHT_WIDTH
         if secs >= EVID_CHEAP_SECS:
             return not EVID_WIDTH or width <= EVID_WIDTH
         return not EVID_BUDGET or secs * width <= EVID_BUDGET
