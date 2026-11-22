@@ -13,9 +13,6 @@ RUN git clone https://github.com/tobymao/sqlglot /opt/sqlglot \
     && git checkout eb11aec4be8cb2122afe713a4816662c3f0fb2fa \
     && rm -rf .git
 
-# Experiment: report a 1 s+ test only when at most 10 tests reached the changed statement.
-ENV SEL_MAX_TEST_SECS=1
-
 # 3. Copy your own code and any committed maps
 COPY --chown=65534:65534 selector.py /app/selector.py
 COPY maps/ /app/maps/
